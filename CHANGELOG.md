@@ -1,6 +1,23 @@
 # Change Log
 All notable changes to Sylvan will be documented in this file.
 
+## [Unreleased]
+### Changed
+- The unique nodes table and operation cache are now dynamically allocated:
+  only the current size is allocated and tables grow on demand (during garbage
+  collection) up to the configured maximum. The maximum is now just a growth
+  cap that costs no memory, so it can be set generously (up to 2^40 table
+  buckets) — no more estimating table sizes up front, on any platform.
+  On Linux, growing uses `mremap`, so no data is copied.
+- `llmsset_set_size` grows the allocation and is no longer an inline function.
+- Maximum table size is now checked against 2^40 (the actual index width)
+  instead of 2^42.
+- The unique-table hash backend is now `gtl::parallel_flat_hash_map` by default
+  (requires C++20). Configure with `-DSYLVAN_TABLE_GTL=OFF` to use the original
+  lockless probing table, which benchmarks ~2x faster end-to-end with ~2x less
+  memory.
+- Added `examples/bench_table.c`, a microbenchmark for the unique table.
+
 ## [1.8.1] - 2023-11-17
 ### Added
 - Added CMake scripts for installing again.

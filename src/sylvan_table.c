@@ -21,6 +21,33 @@
 #include <errno.h>  // for errno
 #include <string.h> // memset
 
+#if SYLVAN_TABLE_GTL
+/**
+ * Alternative hash-lookup backend using gtl::parallel_flat_hash_map
+ * (implemented in sylvan_table_gtl.cpp). The data array, bitmaps and gc
+ * marking stay identical; only the hash array is replaced by the map.
+ */
+extern uint64_t sylvan_gtl_find(uint64_t a, uint64_t b, int custom);
+extern uint64_t sylvan_gtl_insert(uint64_t a, uint64_t b, int custom, uint64_t idx);
+extern void sylvan_gtl_clear(void);
+
+// the one table, for the hash/equals callbacks (multiple tables are already unsupported)
+static llmsset_t gtl_dbs;
+
+uint64_t
+llmsset_gtl_hash(uint64_t a, uint64_t b, int custom)
+{
+    uint64_t h = 14695981039346656037LLU;
+    return custom ? gtl_dbs->hash_cb(a, b, h) : sylvan_tabhash16(a, b, h);
+}
+
+int
+llmsset_gtl_equals(uint64_t a1, uint64_t b1, uint64_t a2, uint64_t b2, int custom)
+{
+    return custom ? gtl_dbs->equals_cb(a1, b1, a2, b2) : (a1 == a2 && b1 == b2);
+}
+#endif
+
 DECLARE_THREAD_LOCAL(my_region, uint64_t);
 
 VOID_TASK_0(llmsset_reset_region)
@@ -113,6 +140,39 @@ static const uint64_t CL_MASK_R   = ((LINE_SIZE) / 8) - 1;
 #define MASK_INDEX ((uint64_t)0x000000ffffffffff)
 #define MASK_HASH  ((uint64_t)0xffffff0000000000)
 
+#if SYLVAN_TABLE_GTL
+static inline uint64_t
+llmsset_lookup2(const llmsset_t dbs, uint64_t a, uint64_t b, int* created, const int custom)
+{
+    uint64_t idx = sylvan_gtl_find(a, b, custom);
+    if (idx != 0) {
+        *created = 0;
+        return idx;
+    }
+
+    uint64_t cidx = claim_data_bucket(dbs);
+    if (cidx == (uint64_t)-1) return 0; // full: caller triggers gc
+    if (custom) dbs->create_cb(&a, &b);
+    uint64_t *d_ptr = ((uint64_t*)dbs->data) + 2*cidx;
+    d_ptr[0] = a;
+    d_ptr[1] = b;
+    if (custom) set_custom_bucket(dbs, cidx, custom);
+
+    idx = sylvan_gtl_insert(a, b, custom, cidx);
+    if (idx != cidx) {
+        // another worker inserted the same node first
+        if (custom) {
+            dbs->destroy_cb(a, b);
+            set_custom_bucket(dbs, cidx, 0);
+        }
+        release_data_bucket(dbs, cidx);
+        *created = 0;
+        return idx;
+    }
+    *created = 1;
+    return cidx;
+}
+#else
 static inline uint64_t
 llmsset_lookup2(const llmsset_t dbs, uint64_t a, uint64_t b, int* created, const int custom)
 {
@@ -191,6 +251,7 @@ llmsset_lookup2(const llmsset_t dbs, uint64_t a, uint64_t b, int* created, const
         }
     }
 }
+#endif
 
 uint64_t
 llmsset_lookup(const llmsset_t dbs, const uint64_t a, const uint64_t b, int* created)
@@ -204,6 +265,15 @@ llmsset_lookupc(const llmsset_t dbs, const uint64_t a, const uint64_t b, int* cr
     return llmsset_lookup2(dbs, a, b, created, 1);
 }
 
+#if SYLVAN_TABLE_GTL
+int
+llmsset_rehash_bucket(const llmsset_t dbs, uint64_t d_idx)
+{
+    const uint64_t * const d_ptr = ((uint64_t*)dbs->data) + 2*d_idx;
+    sylvan_gtl_insert(d_ptr[0], d_ptr[1], is_custom_bucket(dbs, d_idx), d_idx);
+    return 1;
+}
+#else
 int
 llmsset_rehash_bucket(const llmsset_t dbs, uint64_t d_idx)
 {
@@ -251,6 +321,80 @@ llmsset_rehash_bucket(const llmsset_t dbs, uint64_t d_idx)
         }
     }
 }
+#endif
+
+/* bitmap1 has one bit per region of 512 buckets; at least one full word */
+static inline size_t
+bitmap1_size(size_t size)
+{
+    size_t bytes = size / (512*8);
+    return bytes < 8 ? 8 : bytes;
+}
+
+/**
+ * Grow the arrays to <size> buckets. Only called while the world is stopped
+ * (no concurrent lookups), i.e. from llmsset_create or during gc.
+ * The data array and bitmaps move with contents preserved; the hash array is
+ * reallocated empty since every resize is followed by a full rehash anyway.
+ */
+static void
+llmsset_alloc(llmsset_t dbs, size_t size)
+{
+    // ponytail: grow-only; sylvan never shrinks tables, so shrinking just lowers table_size
+    if (size <= dbs->alloc_size) return;
+
+    size_t old = dbs->alloc_size;
+    if (old == 0) {
+#if !SYLVAN_TABLE_GTL
+        dbs->table = (_Atomic(uint64_t)*)alloc_aligned(size * 8);
+#endif
+        dbs->data = (uint8_t*)alloc_aligned(size * 16);
+        dbs->bitmap1 = (_Atomic(uint64_t)*)alloc_aligned(bitmap1_size(size));
+        dbs->bitmap2 = (_Atomic(uint64_t)*)alloc_aligned(size / 8);
+        dbs->bitmapc = (uint64_t*)alloc_aligned(size / 8);
+    } else {
+#if !SYLVAN_TABLE_GTL
+        free_aligned((void*)dbs->table, old * 8);
+        dbs->table = (_Atomic(uint64_t)*)alloc_aligned(size * 8);
+#endif
+        dbs->data = (uint8_t*)realloc_aligned(dbs->data, old * 16, size * 16);
+        dbs->bitmap1 = (_Atomic(uint64_t)*)realloc_aligned((void*)dbs->bitmap1, bitmap1_size(old), bitmap1_size(size));
+        dbs->bitmap2 = (_Atomic(uint64_t)*)realloc_aligned((void*)dbs->bitmap2, old / 8, size / 8);
+        dbs->bitmapc = (uint64_t*)realloc_aligned(dbs->bitmapc, old / 8, size / 8);
+    }
+
+#if !SYLVAN_TABLE_GTL
+    if (dbs->table == 0) {
+        fprintf(stderr, "llmsset: Unable to allocate memory: %s!\n", strerror(errno));
+        exit(1);
+    }
+#if defined(madvise) && defined(MADV_RANDOM)
+    madvise(dbs->table, size * 8, MADV_RANDOM);
+#endif
+#endif
+    if (dbs->data == 0 || dbs->bitmap1 == 0 || dbs->bitmap2 == 0 || dbs->bitmapc == 0) {
+        fprintf(stderr, "llmsset: Unable to allocate memory: %s!\n", strerror(errno));
+        exit(1);
+    }
+
+    dbs->alloc_size = size;
+}
+
+void
+llmsset_set_size(llmsset_t dbs, size_t size)
+{
+    /* check bounds (don't be rediculous) */
+    if (size > 128 && size <= dbs->max_size) {
+        llmsset_alloc(dbs, size);
+        dbs->table_size = size;
+#if LLMSSET_MASK
+        /* Warning: if size is not a power of two, you will get interesting behavior */
+        dbs->mask = dbs->table_size - 1;
+#endif
+        /* Set threshold: number of cache lines to probe before giving up on node insertion */
+        dbs->threshold = 192 - 2 * __builtin_clzll(dbs->table_size);
+    }
+}
 
 llmsset_t
 llmsset_create(size_t initial_size, size_t max_size)
@@ -287,31 +431,19 @@ llmsset_create(size_t initial_size, size_t max_size)
     }
 
     dbs->max_size = max_size;
-    llmsset_set_size(dbs, initial_size);
+    dbs->alloc_size = 0;
+#if SYLVAN_TABLE_GTL
+    dbs->table = 0;
+    gtl_dbs = dbs;
+#endif
 
-    /* This implementation of "resizable hash table" allocates the max_size table in virtual memory,
-       but only uses the "actual size" part in real memory */
-
-    dbs->table = (_Atomic(uint64_t)*) alloc_aligned(dbs->max_size * 8);
-    dbs->data = (uint8_t*) alloc_aligned(dbs->max_size * 16);
-
-    /* Also allocate bitmaps. Each region is 64*8 = 512 buckets.
-       Overhead of bitmap1: 1 bit per 4096 bucket.
+    /* The table is allocated at the current size and grows dynamically (during gc).
+       Each region is 64*8 = 512 buckets.
+       Overhead of bitmap1: 1 bit per 4096 buckets.
        Overhead of bitmap2: 1 bit per bucket.
        Overhead of bitmapc: 1 bit per bucket. */
 
-    dbs->bitmap1 = (_Atomic(uint64_t)*)alloc_aligned(dbs->max_size / (512*8));
-    dbs->bitmap2 = (_Atomic(uint64_t)*)alloc_aligned(dbs->max_size / 8);
-    dbs->bitmapc = (uint64_t*)alloc_aligned(dbs->max_size / 8);
-
-    if (dbs->table == 0 || dbs->data == 0 || dbs->bitmap1 == 0 || dbs->bitmap2 == 0 || dbs->bitmapc == 0) {
-        fprintf(stderr, "llmsset_create: Unable to allocate memory: %s!\n", strerror(errno));
-        exit(1);
-    }
-
-#if defined(madvise) && defined(MADV_RANDOM)
-    madvise(dbs->table, dbs->max_size * 8, MADV_RANDOM);
-#endif
+    llmsset_set_size(dbs, initial_size);
 
     // forbid first two positions (index 0 and 1)
     dbs->bitmap2[0] = 0xc000000000000000LL;
@@ -337,11 +469,15 @@ llmsset_create(size_t initial_size, size_t max_size)
 void
 llmsset_free(llmsset_t dbs)
 {
-    free_aligned(dbs->table, dbs->max_size * 8);
-    free_aligned(dbs->data, dbs->max_size * 16);
-    free_aligned(dbs->bitmap1, dbs->max_size / (512*8));
-    free_aligned(dbs->bitmap2, dbs->max_size / 8);
-    free_aligned(dbs->bitmapc, dbs->max_size / 8);
+#if SYLVAN_TABLE_GTL
+    sylvan_gtl_clear();
+#else
+    free_aligned(dbs->table, dbs->alloc_size * 8);
+#endif
+    free_aligned(dbs->data, dbs->alloc_size * 16);
+    free_aligned(dbs->bitmap1, bitmap1_size(dbs->alloc_size));
+    free_aligned(dbs->bitmap2, dbs->alloc_size / 8);
+    free_aligned(dbs->bitmapc, dbs->alloc_size / 8);
     free_aligned(dbs, sizeof(struct llmsset));
 }
 
@@ -353,8 +489,8 @@ VOID_TASK_IMPL_1(llmsset_clear, llmsset_t, dbs)
 
 VOID_TASK_IMPL_1(llmsset_clear_data, llmsset_t, dbs)
 {
-    clear_aligned(dbs->bitmap1, dbs->max_size / (512*8));
-    clear_aligned(dbs->bitmap2, dbs->max_size / 8);
+    clear_aligned(dbs->bitmap1, bitmap1_size(dbs->alloc_size));
+    clear_aligned(dbs->bitmap2, dbs->alloc_size / 8);
 
     // forbid first two positions (index 0 and 1)
     dbs->bitmap2[0] = 0xc000000000000000LL;
@@ -364,7 +500,12 @@ VOID_TASK_IMPL_1(llmsset_clear_data, llmsset_t, dbs)
 
 VOID_TASK_IMPL_1(llmsset_clear_hashes, llmsset_t, dbs)
 {
-    clear_aligned(dbs->table, dbs->max_size * 8);
+#if SYLVAN_TABLE_GTL
+    sylvan_gtl_clear();
+    (void)dbs;
+#else
+    clear_aligned(dbs->table, dbs->table_size * 8);
+#endif
 }
 
 int

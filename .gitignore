@@ -8,3 +8,6 @@
 
 # CMake files
 build/
+
+# CMake build directories
+build*/

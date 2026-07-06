@@ -56,8 +56,9 @@ typedef struct llmsset
     _Atomic(uint64_t)* bitmap1;      // ownership bitmap (per 512 buckets)
     _Atomic(uint64_t)* bitmap2;      // bitmap for "contains data"
     uint64_t*          bitmapc;      // bitmap for "use custom functions"
-    size_t             max_size;     // maximum size of the hash table (for resizing)
+    size_t             max_size;     // maximum size of the hash table (resize cap; not preallocated)
     size_t             table_size;   // size of the hash table (number of slots) --> power of 2!
+    size_t             alloc_size;   // number of buckets the arrays are actually allocated for
 #if LLMSSET_MASK
     size_t             mask;         // size-1
 #endif
@@ -80,8 +81,9 @@ llmsset_index_to_ptr(const llmsset_t dbs, size_t index)
 
 /**
  * Create the set.
- * This will allocate a set of <max_size> buckets in virtual memory.
- * The actual space used is <initial_size> buckets.
+ * This allocates <initial_size> buckets; the set grows dynamically (during
+ * garbage collection) up to <max_size> buckets. <max_size> is only a cap and
+ * costs no memory, so it can safely be set very high (up to 2^40).
  */
 llmsset_t llmsset_create(size_t initial_size, size_t max_size);
 
@@ -109,24 +111,12 @@ llmsset_get_size(const llmsset_t dbs)
 }
 
 /**
- * Set the table size of the set.
- * Typically called during garbage collection, after clear and before rehash.
- * Returns 0 if dbs->table_size > dbs->max_size!
+ * Set the table size of the set, growing the underlying allocation if needed.
+ * Growing moves the data array (node data and mark bitmaps are preserved);
+ * the hash array is reallocated empty, so a rehash is mandatory afterwards.
+ * MUST be called during garbage collection, after clear and before rehash.
  */
-static inline void
-llmsset_set_size(llmsset_t dbs, size_t size)
-{
-    /* check bounds (don't be rediculous) */
-    if (size > 128 && size <= dbs->max_size) {
-        dbs->table_size = size;
-#if LLMSSET_MASK
-        /* Warning: if size is not a power of two, you will get interesting behavior */
-        dbs->mask = dbs->table_size - 1;
-#endif
-        /* Set threshold: number of cache lines to probe before giving up on node insertion */
-        dbs->threshold = 192 - 2 * __builtin_clzll(dbs->table_size);
-    }
-}
+void llmsset_set_size(llmsset_t dbs, size_t size);
 
 /**
  * Core function: find existing data or add new.

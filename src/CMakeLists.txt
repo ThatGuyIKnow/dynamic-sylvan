@@ -74,6 +74,9 @@ target_include_directories(sylvan PUBLIC
 
 target_link_libraries(sylvan PUBLIC m pthread lace)
 
+# for mremap in sylvan_align.h
+target_compile_definitions(sylvan PRIVATE _GNU_SOURCE)
+
 option(SYLVAN_USE_MMAP "Let Sylvan use mmap to allocate (virtual) memory" ON)
 if(SYLVAN_USE_MMAP)
     include(CheckSymbolExists)
@@ -82,14 +85,30 @@ if(SYLVAN_USE_MMAP)
         message(WARNING " mmap not found: disabling mmap support")
         set(SYLVAN_USE_MMAP OFF)
     else()
-        set_target_properties(sylvan PROPERTIES COMPILE_DEFINITIONS "SYLVAN_USE_MMAP")
+        target_compile_definitions(sylvan PRIVATE SYLVAN_USE_MMAP)
     endif()
+endif()
+
+# Alternative unique-table hash backend based on gtl::parallel_flat_hash_map
+option(SYLVAN_TABLE_GTL "Use gtl parallel_flat_hash_map as unique table hash backend" ON)
+if(SYLVAN_TABLE_GTL)
+    FetchContent_Declare(
+        gtl
+        GIT_REPOSITORY https://github.com/greg7mdp/gtl.git
+        GIT_TAG v1.2.0
+    )
+    FetchContent_MakeAvailable(gtl)
+    target_sources(sylvan PRIVATE sylvan_table_gtl.cpp)
+    target_compile_features(sylvan PRIVATE cxx_std_20)
+    target_compile_definitions(sylvan PRIVATE SYLVAN_TABLE_GTL=1)
+    # header-only: take the include dirs, avoid dragging gtl into the install export
+    target_include_directories(sylvan PRIVATE $<TARGET_PROPERTY:gtl,INTERFACE_INCLUDE_DIRECTORIES>)
 endif()
 
 # Do we want to collect BDD statistics?
 option(SYLVAN_STATS "Let Sylvan collect statistics at runtime" OFF)
 if(SYLVAN_STATS)
-    set_target_properties(sylvan PROPERTIES COMPILE_DEFINITIONS "SYLVAN_STATS")
+    target_compile_definitions(sylvan PRIVATE SYLVAN_STATS)
 endif()
 
 set_target_properties(sylvan PROPERTIES

@@ -22,6 +22,9 @@ target_sources(ldd2bdd PRIVATE getrss.c getrss.h)
 
 add_example(nqueens nqueens.c)
 
+add_example(bench_table bench_table.c)
+target_sources(bench_table PRIVATE getrss.c getrss.h)
+
 add_example(simple simple.cpp)
 
 # Check if we have Meddly

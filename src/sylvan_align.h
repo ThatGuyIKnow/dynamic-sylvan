@@ -72,6 +72,30 @@ free_aligned(void* ptr, size_t size)
     (void)size; // suppress unused parameter
 }
 
+/**
+ * Grow an allocation from <oldsize> to <newsize> bytes, preserving contents.
+ * The new region beyond <oldsize> is zeroed. The returned pointer may differ.
+ * Returns 0 on failure. Never shrinks (newsize <= oldsize returns ptr unchanged).
+ */
+static inline void*
+realloc_aligned(void* ptr, size_t oldsize, size_t newsize)
+{
+    oldsize = (oldsize + LINE_SIZE - 1) & (~(LINE_SIZE - 1));
+    newsize = (newsize + LINE_SIZE - 1) & (~(LINE_SIZE - 1));
+    if (newsize <= oldsize) return ptr;
+#if SYLVAN_USE_MMAP && defined(MREMAP_MAYMOVE)
+    // no copy: the kernel just moves the page tables
+    void* res = mremap(ptr, oldsize, newsize, MREMAP_MAYMOVE);
+    return res == MAP_FAILED ? 0 : res;
+#else
+    void* res = alloc_aligned(newsize);
+    if (res == 0) return 0;
+    memcpy(res, ptr, oldsize);
+    free_aligned(ptr, oldsize);
+    return res;
+#endif
+}
+
 static inline void
 clear_aligned(void* ptr, size_t size)
 {

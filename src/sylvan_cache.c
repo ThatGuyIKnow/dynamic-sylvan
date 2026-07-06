@@ -237,8 +237,9 @@ cache_create(size_t _cache_size, size_t _max_size)
         exit(1);
     }
 
-    cache_table = (cache_entry_t)alloc_aligned(cache_max * sizeof(struct cache_entry));
-    cache_status = (uint32_t*)alloc_aligned(cache_max * sizeof(uint32_t));
+    // only the current size is allocated; cache_max is just the resize cap
+    cache_table = (cache_entry_t)alloc_aligned(cache_size * sizeof(struct cache_entry));
+    cache_status = (uint32_t*)alloc_aligned(cache_size * sizeof(uint32_t));
     if (cache_table == 0 || cache_status == 0) {
         fprintf(stderr, "cache_create: Unable to allocate memory: %s!\n", strerror(errno));
         exit(1);
@@ -250,8 +251,8 @@ cache_create(size_t _cache_size, size_t _max_size)
 void
 cache_free()
 {
-    free_aligned(cache_table, cache_max * sizeof(struct cache_entry));
-    free_aligned(cache_status, cache_max * sizeof(uint32_t));
+    free_aligned(cache_table, cache_size * sizeof(struct cache_entry));
+    free_aligned(cache_status, cache_size * sizeof(uint32_t));
 }
 
 void
