@@ -12,10 +12,15 @@ All notable changes to Sylvan will be documented in this file.
 - `llmsset_set_size` grows the allocation and is no longer an inline function.
 - Maximum table size is now checked against 2^40 (the actual index width)
   instead of 2^42.
-- The unique-table hash backend is now `gtl::parallel_flat_hash_map` by default
-  (requires C++20). Configure with `-DSYLVAN_TABLE_GTL=OFF` to use the original
-  lockless probing table, which benchmarks ~2x faster end-to-end with ~2x less
-  memory.
+- An alternative unique-table hash backend based on `gtl::parallel_flat_hash_map`
+  is available with `-DSYLVAN_TABLE_GTL=ON` (requires C++20). It is OFF by
+  default: the default lockless probing table is ~2x faster end-to-end with
+  ~2x less memory single-threaded, and the gap grows with worker count (the
+  gtl map's per-submap mutexes serialize parallel lookups).
+- The operation-cache hash now uses a full-avalanche mixer (as in Sylvan 1.10)
+  instead of the FNV-style multiply chain, whose low (index) bits ignored the
+  high bits of the operands — e.g. BDD complement marks — causing avoidable
+  cache-slot collisions.
 - Added `examples/bench_table.c`, a microbenchmark for the unique table.
 
 ## [1.8.1] - 2023-11-17

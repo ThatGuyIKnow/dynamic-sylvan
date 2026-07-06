@@ -89,8 +89,10 @@ if(SYLVAN_USE_MMAP)
     endif()
 endif()
 
-# Alternative unique-table hash backend based on gtl::parallel_flat_hash_map
-option(SYLVAN_TABLE_GTL "Use gtl parallel_flat_hash_map as unique table hash backend" ON)
+# Alternative unique-table hash backend based on gtl::parallel_flat_hash_map.
+# OFF by default: its per-submap mutexes serialize lookups under multiple lace
+# workers (measured >2x slower end-to-end at 4 workers vs the lockless table).
+option(SYLVAN_TABLE_GTL "Use gtl parallel_flat_hash_map as unique table hash backend" OFF)
 if(SYLVAN_TABLE_GTL)
     FetchContent_Declare(
         gtl
